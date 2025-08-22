@@ -1,5 +1,9 @@
 # WAT 
-esp32 c6 with LCS
+esp32 c6 with LCS waveshare or spotpear
+https://spotpear.com/wiki/ESP32-C6-1.47-inch-LCD-Display-Screen-LVGL-SD-WIFI6-ST7789.html#VScode
+or
+https://www.waveshare.com/wiki/ESP32-C6-LCD-1.47
+
 ![Esp32C6WIthLCD_small.jpeg](docs/Esp32C6WIthLCD_small.jpeg)
 ```
 #run with 
