@@ -8,33 +8,31 @@
 
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
-use esp_hal::main;
 use esp_hal::delay::Delay;
+use esp_hal::gpio::{self, Level, Output, OutputConfig};
+use esp_hal::main;
 use esp_hal::rtc_cntl::Rtc;
-use esp_hal::timer::timg::TimerGroup;
-use esp_hal::spi::master::Spi;
-use esp_hal::spi::master::Config as SpiConfig;
+use esp_hal::spi::master::{Config as SpiConfig, Spi};
+use esp_hal::spi::Mode;
 use esp_hal::time::{Duration, Instant, Rate};
+use esp_hal::timer::timg::TimerGroup;
 use log::info;
-use core::default::Default;
-use esp_hal::gpio::{self, Output, OutputConfig, Level};
+
+use embedded_graphics::{
+    geometry::OriginDimensions,
+    pixelcolor::{Rgb565, RgbColor},
+    prelude::*,
+    primitives::{Circle, PrimitiveStyle, Triangle},
+};
 
 use embedded_hal_bus::spi::ExclusiveDevice;
 
-use embedded_graphics::{
-    pixelcolor::Rgb565,
-    prelude::*,
-    primitives::{Circle, Primitive, PrimitiveStyle, Triangle},
+use mipidsi::{
+    interface::SpiInterface,
+    models::ST7789,
+    options::{ColorInversion, ColorOrder, Orientation, Rotation},
+    Builder,
 };
-use esp_hal::spi::Mode;
-
-// Provides the parallel port and display interface builders
-use mipidsi::interface::SpiInterface;
-use mipidsi::options::Rotation;
-
-// Provides the Display builder
-use mipidsi::{models::ST7789, Builder};
-use mipidsi::options::Orientation;
 
 extern crate alloc;
 
@@ -54,7 +52,6 @@ fn main() -> ! {
 
     esp_alloc::heap_allocator!(size: 64 * 1024);
 
-
     let mut rtc = Rtc::new(peripherals.LPWR);
     let timer_group0 = TimerGroup::new(peripherals.TIMG0);
     let mut wdt0 = timer_group0.wdt;
@@ -65,6 +62,8 @@ fn main() -> ! {
     wdt0.disable();
     wdt1.disable();
     let mut delay = Delay::new();
+
+    // TODO DMA access for fast write
 
     let dc = Output::new(peripherals.GPIO15, Level::Low, OutputConfig::default());
     // Define the reset pin as digital outputs and make it high
@@ -80,7 +79,7 @@ fn main() -> ! {
     let mosi = peripherals.GPIO6;
     let cs = peripherals.GPIO14;
     let spi_cfg = SpiConfig::default()
-        .with_frequency(Rate::from_mhz(12))
+        .with_frequency(Rate::from_mhz(80))
         .with_mode(Mode::_0);
     let mut spi = Spi::new(peripherals.SPI2, spi_cfg).unwrap();
     let spi = spi
@@ -99,60 +98,69 @@ fn main() -> ! {
     // Define the display from the display interface and initialize it
     let mut display = Builder::new(ST7789, di)
         .display_size(172, 320)
-        .orientation(Orientation::new().rotate(Rotation::Deg0))
-        .set_offset(34, 0)
+        .orientation(Orientation::new().rotate(Rotation::Deg90))
+        .color_order(ColorOrder::Rgb)
+        .invert_colors(ColorInversion::Inverted)
+        .display_offset(34, 0)
         .reset_pin(rst)
         .init(&mut delay)
         .unwrap();
 
-    // Make the display all black
-    display.clear(Rgb565::WHITE).unwrap();
-
-    // Draw a smiley face with white eyes and a red mouth
+    // Make the display all white
+    display.clear(Rgb565::BLACK).unwrap();
+    draw_smiley(&mut display);
 
     loop {
-        // Draw an upside down red triangle to represent a smiling mouth
-        Triangle::new(
-            Point::new(30, 140),
-            Point::new(60, 160),
-            Point::new(130, 130),
-        )
-            .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
-            .draw(&mut display).ok();
-            // .draw(display)?;
+        // Draw a full smiley face using embedded-graphics primitives
         info!("Hello world!");
         let delay_start = Instant::now();
-        while delay_start.elapsed() < Duration::from_millis(500) {}
+        while delay_start.elapsed() < Duration::from_millis(1000) {}
     }
 
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-rc.0/examples/src/bin
 }
 
-// fn draw_smiley<D>(display: &mut D) -> Result<(), core::convert::Infallible>
-// where
-//     D: embedded_graphics::draw_target::DrawTarget<Color = Rgb565>,
-// {
-//     use embedded_graphics::pixelcolor::RgbColor;
-//     use embedded_graphics::primitives::{Circle, PrimitiveStyle, Triangle};
-//     use embedded_graphics::prelude::*;
-//
-//     // Face
-//     Circle::new(Point::new(86, 160), 150)
-//         .into_styled(PrimitiveStyle::with_fill(Rgb565::YELLOW))
-//         .draw(display)?;
-//
-//     // Eyes
-//     Circle::new(Point::new(60, 120), 15)
-//         .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
-//         .draw(display)?;
-//     Circle::new(Point::new(112, 120), 15)
-//         .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
-//         .draw(display)?;
-//
-//     // Mouth (triangle)
-//     Triangle::new(Point::new(60, 190), Point::new(112, 190), Point::new(86, 210))
-//         .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
-//         .draw(display)?;
-//
-//     Ok(())
-// }
+fn draw_smiley<D>(display: &mut D)
+where
+    D: embedded_graphics::draw_target::DrawTarget<Color = Rgb565> + OriginDimensions,
+{
+    let Size { width, height } = display.size();
+    let (w, h) = (width as i32, height as i32);
+
+    // Keep some margin so rounded glass corners don’t clip the face
+    let margin = 14_i32;
+
+    // Center and radius that fit BOTH 172×320 and rounded mask
+    let cx = w / 2;
+    let cy = h / 2 + (h - w).max(0) / 6; // nudge down a bit on tall screens
+    let r  = (w.min(h) / 2) - margin;
+
+    // Clear
+    let _ = display.clear(Rgb565::new(200, 230, 255)); // light blue bg
+
+    // Face
+    let _ = Circle::new(Point::new(cx - r, cy - r), (2 * r) as u32)
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::YELLOW))
+        .draw(display);
+
+    // Eyes
+    let eye_dx = r / 3;
+    let eye_dy = -r / 5;
+    let eye_r  = r / 10;
+    for ex in [-eye_dx, eye_dx] {
+        let _ = Circle::new(Point::new(cx + ex - eye_r, cy + eye_dy - eye_r), (2 * eye_r) as u32)
+            .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+            .draw(display);
+    }
+
+    // Mouth (triangle smile)
+    let mouth_w = (r as f32 * 1.2) as i32;
+    let mouth_y = cy + r / 3;
+    let mouth_h = r / 4;
+    let _ = Triangle::new(
+        Point::new(cx - mouth_w / 2, mouth_y),
+        Point::new(cx + mouth_w / 2, mouth_y),
+        Point::new(cx, mouth_y + mouth_h),
+    )
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
+        .draw(display);
+}
