@@ -66,21 +66,21 @@ fn main() -> ! {
     wdt1.disable();
     let mut delay = Delay::new();
 
-    let dc = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
+    let dc = Output::new(peripherals.GPIO15, Level::Low, OutputConfig::default());
     // Define the reset pin as digital outputs and make it high
-    let mut rst = Output::new(peripherals.GPIO20, Level::Low, OutputConfig::default());
+    let mut rst = Output::new(peripherals.GPIO21, Level::Low, OutputConfig::default());
     rst.set_high();
 
-    let mut bl = Output::new(peripherals.GPIO0, Level::Low, OutputConfig::default());
+    let mut bl = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
     bl.set_high();
 
     // Define the SPI pins and create the SPI interface
-    let sck = peripherals.GPIO10;
+    let sck = peripherals.GPIO7;
     let miso = gpio::NoPin;
-    let mosi = peripherals.GPIO9;
-    let cs = peripherals.GPIO15;
+    let mosi = peripherals.GPIO6;
+    let cs = peripherals.GPIO14;
     let spi_cfg = SpiConfig::default()
-        .with_frequency(Rate::from_khz(100))
+        .with_frequency(Rate::from_mhz(12))
         .with_mode(Mode::_0);
     let mut spi = Spi::new(peripherals.SPI2, spi_cfg).unwrap();
     let spi = spi
@@ -99,13 +99,14 @@ fn main() -> ! {
     // Define the display from the display interface and initialize it
     let mut display = Builder::new(ST7789, di)
         .display_size(172, 320)
-        .orientation(Orientation::new().rotate(Rotation::Deg0)) // try Deg90 if rotated
+        .orientation(Orientation::new().rotate(Rotation::Deg0))
+        .set_offset(34, 0)
         .reset_pin(rst)
         .init(&mut delay)
         .unwrap();
 
     // Make the display all black
-    display.clear(Rgb565::BLACK).unwrap();
+    display.clear(Rgb565::WHITE).unwrap();
 
     // Draw a smiley face with white eyes and a red mouth
 
