@@ -8,13 +8,15 @@
 
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
+use core::sync::atomic::{AtomicBool, Ordering};
+static PREV: AtomicBool = AtomicBool::new(false);
 use esp_hal::delay::Delay;
-use esp_hal::gpio::{self, Level, Output, OutputConfig};
+use esp_hal::gpio::{self, Level, Output, OutputConfig, Input, InputConfig};
 use esp_hal::main;
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
-use esp_hal::time::{Duration, Instant, Rate};
+use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use log::info;
 
@@ -59,6 +61,8 @@ fn main() -> ! {
     wdt1.disable();
     let mut delay = Delay::new();
 
+    let boot_btn = Input::new(peripherals.GPIO9, InputConfig::default());
+
     // TODO DMA access for fast write
     let dc = Output::new(peripherals.GPIO15, Level::Low, OutputConfig::default());
     // Define the reset pin as digital outputs and make it high
@@ -76,7 +80,7 @@ fn main() -> ! {
     let spi_cfg = SpiConfig::default()
         .with_frequency(Rate::from_mhz(80))
         .with_mode(Mode::_0);
-    let mut spi = Spi::new(peripherals.SPI2, spi_cfg).unwrap();
+    let spi = Spi::new(peripherals.SPI2, spi_cfg).unwrap();
     let spi = spi
         .with_sck(sck)
         .with_mosi(mosi)
@@ -105,17 +109,38 @@ fn main() -> ! {
     display.clear(Rgb565::BLACK).unwrap();
     const RAW_W: u32 = 172;
     const RAW_H: u32 = 320;
-    let raw = ImageRawLE::<Rgb565>::new(
-        include_bytes!("../../assets/rgb/pic_2_172x320.rgb565"),
-        RAW_W,
-    );
-    Image::new(&raw, Point::new(0, 0))
+
+    // Two images: toggle with BOOT button
+    let pic1: &[u8] = include_bytes!("../../assets/rgb/pic_1_172x320.rgb565");
+    let pic2: &[u8] = include_bytes!("../../assets/rgb/pic_2_172x320.rgb565");
+    let raw1 = ImageRawLE::<Rgb565>::new(pic1, RAW_W);
+    let raw2 = ImageRawLE::<Rgb565>::new(pic2, RAW_W);
+    let mut img_idx: usize = 0;
+
+    // Draw initial image
+    Image::new(&raw1, Point::new(0, 0))
         .draw(&mut display)
         .unwrap();
 
     loop {
-        info!(".");
-        let delay_start = Instant::now();
-        while delay_start.elapsed() < Duration::from_millis(3000) {}
+        // Poll BOOT (GPIO9). Active-low on most boards.
+        let pressed = boot_btn.is_low();
+        let was_pressed = PREV.load(Ordering::Relaxed);
+        if pressed && !was_pressed {
+            info!("BOOT pressed");
+            // Toggle image index and draw
+            img_idx ^= 1;
+            match img_idx {
+                0 => { Image::new(&raw1, Point::new(0, 0)).draw(&mut display).ok(); }
+                _ => { Image::new(&raw2, Point::new(0, 0)).draw(&mut display).ok(); }
+            }
+        }
+        if !pressed && was_pressed {
+            info!("BOOT released");
+        }
+        PREV.store(pressed, Ordering::Relaxed);
+
+        // Also print a dot periodically so you see liveness
+        delay.delay_millis(50);
     }
 }
