@@ -8,7 +8,7 @@
 
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::AtomicBool;
 use core::cell::RefCell;
 static PREV: AtomicBool = AtomicBool::new(false);
 use esp_hal::delay::Delay;
@@ -21,8 +21,7 @@ use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use log::info;
 use embedded_hal_bus::spi::RefCellDevice;
-use embedded_sdmmc::sdcard::SdCard;
-use embedded_sdmmc::{VolumeManager, VolumeIdx, TimeSource, Timestamp};
+use embedded_sdmmc::{SdCard, VolumeManager, VolumeIdx, TimeSource, Timestamp, Mode as SdMode, ShortFileName};
 
 use embedded_graphics::{
     pixelcolor::Rgb565,
@@ -44,6 +43,14 @@ impl TimeSource for DummyTime {
         Timestamp::from_fat(0, 0)
     }
 }
+
+// RAW movie geometry for 172x320 RGB565LE frames
+const RAW_W: u32 = 172;
+const RAW_H: u32 = 320;
+const FRAME_SZ: usize = (RAW_W as usize) * (RAW_H as usize) * 2; // bytes
+
+// Single frame buffer (~110,080 bytes)
+static mut MOV_FRAMEBUF: [u8; FRAME_SZ] = [0u8; FRAME_SZ];
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -71,7 +78,7 @@ fn main() -> ! {
     wdt1.disable();
     let mut delay = Delay::new();
 
-    let boot_btn = Input::new(peripherals.GPIO9, InputConfig::default());
+    let _boot_btn = Input::new(peripherals.GPIO9, InputConfig::default());
 
     // TODO DMA access for fast write
     let dc = Output::new(peripherals.GPIO15, Level::Low, OutputConfig::default());
@@ -104,31 +111,22 @@ fn main() -> ! {
     // SD CS on GPIO4 per board pinout; use an ExclusiveDevice on the same SPI2 bus
     let sd_cs = Output::new(peripherals.GPIO4, Level::High, OutputConfig::default());
     let sd_dev = RefCellDevice::new(&spi_bus, sd_cs, sd_dev_delay).unwrap();
+    let mut sd_delay_for_card = Delay::new();
 
     // Initialize SD card (SPI mode). `SdCard::new` returns the card directly (not a Result).
     // Probe capacity (may return an error if no card inserted), then release the bus for LCD use.
-    let sd = SdCard::new(sd_dev, &mut delay);
+    let sd = SdCard::new(sd_dev, &mut sd_delay_for_card);
     match sd.num_bytes() {
         Ok(size) => log::info!("SD size: {} bytes", size),
         Err(_) => log::warn!("SD: failed to read size (no card?)"),
     }
 
-    // List files in root directory
+    // Prepare FAT volume manager (keep it alive for movie playback)
     let mut volume_mgr = VolumeManager::new(sd, DummyTime);
-    match volume_mgr.open_volume(VolumeIdx(0)) {
-        Ok(mut volume) => {
-            match volume.open_root_dir() {
-                Ok(root_dir) => {
-                    info!("Listing SD root directory:");
-                    let _ = root_dir.iterate_dir(|e| {
-                        info!(" - {}  {} bytes", e.name, e.size);
-                    });
-                }
-                Err(err) => info!("open_root_dir failed: {:?}", err),
-            }
-        }
-        Err(err) => info!("open_volume failed: {:?}", err),
-    }
+    let mut volume = match volume_mgr.open_volume(VolumeIdx(0)) {
+        Ok(v) => v,
+        Err(err) => { info!("open_volume failed: {:?}", err); loop { delay.delay_millis(1000); } }
+    };
 
     // ---------------- LCD (SPI) ----------------
     // Create a new ExclusiveDevice for the LCD on CS GPIO14 and reuse the same SPI bus.
@@ -154,40 +152,54 @@ fn main() -> ! {
 
     // Clear the display
     display.clear(Rgb565::BLACK).unwrap();
-    const RAW_W: u32 = 172;
-    const RAW_H: u32 = 320;
 
-    // Two images: toggle with BOOT button
-    let pic1: &[u8] = include_bytes!("../../assets/rgb/pic_1_172x320.rgb565");
-    let pic2: &[u8] = include_bytes!("../../assets/rgb/pic_2_172x320.rgb565");
-    let raw1 = ImageRawLE::<Rgb565>::new(pic1, RAW_W);
-    let raw2 = ImageRawLE::<Rgb565>::new(pic2, RAW_W);
-    let mut img_idx: usize = 0;
+    // Open root dir and choose a movie file: prefer names starting with "NO" (e.g., NO_COW...), else first .RAW
+    let mut root_dir = match volume.open_root_dir() {
+        Ok(d) => d,
+        Err(err) => { info!("open_root_dir failed: {:?}", err); loop { delay.delay_millis(1000); } }
+    };
 
-    // Draw initial image
-    Image::new(&raw1, Point::new(0, 0))
-        .draw(&mut display)
-        .unwrap();
-
-    loop {
-        // Poll BOOT (GPIO9). Active-low on most boards.
-        let pressed = boot_btn.is_low();
-        let was_pressed = PREV.load(Ordering::Relaxed);
-        if pressed && !was_pressed {
-            info!("BOOT pressed");
-            // Toggle image index and draw
-            img_idx ^= 1;
-            match img_idx {
-                0 => { Image::new(&raw1, Point::new(0, 0)).draw(&mut display).ok(); }
-                _ => { Image::new(&raw2, Point::new(0, 0)).draw(&mut display).ok(); }
+    let mut chosen: Option<ShortFileName> = None;
+    let _ = root_dir.iterate_dir(|e| {
+        if !e.attributes.is_directory() && e.name.extension() == b"RAW" {
+            // Prefer names beginning with "NO"
+            if e.name.base_name().starts_with(b"NO") {
+                if chosen.is_none() { chosen = Some(e.name.clone()); }
+            } else if chosen.is_none() {
+                chosen = Some(e.name.clone());
             }
         }
-        if !pressed && was_pressed {
-            info!("BOOT released");
-        }
-        PREV.store(pressed, Ordering::Relaxed);
+    });
 
-        // Also print a dot periodically so you see liveness
-        delay.delay_millis(50);
+    if let Some(chosen_name) = chosen {
+        info!("Playing movie: {} ({}x{} RGB565)", chosen_name, RAW_W, RAW_H);
+        loop {
+            if let Ok(mut file) = root_dir.open_file_in_dir(&chosen_name, SdMode::ReadOnly) {
+                loop {
+                    let n = match file.read(unsafe { &mut MOV_FRAMEBUF[..] }) {
+                        Ok(n) => n,
+                        Err(err) => { info!("Read error: {:?}", err); break; }
+                    };
+                    if n == 0 { break; }
+                    if n < FRAME_SZ { info!("Partial trailing frame ({} bytes), stopping", n); break; }
+
+                    // Draw frame
+                    let raw = ImageRawLE::<Rgb565>::new(unsafe { &MOV_FRAMEBUF[..FRAME_SZ] }, RAW_W);
+                    let _ = Image::new(&raw, Point::new(0, 0)).draw(&mut display);
+
+                    // crude frame pacing; adjust as needed
+                    delay.delay_millis(33);
+                }
+
+                let _ = file.close();
+            } else {
+                info!("open_file_in_dir failed; sleeping forever");
+                loop { delay.delay_millis(1000); }
+            }
+            // Loop movie from the beginning
+        }
+    } else {
+        info!("No .RAW movie found in root.");
+        loop { delay.delay_millis(1000); }
     }
 }
