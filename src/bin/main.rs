@@ -22,6 +22,7 @@ use esp_hal::timer::timg::TimerGroup;
 use log::info;
 use embedded_hal_bus::spi::RefCellDevice;
 use embedded_sdmmc::sdcard::SdCard;
+use embedded_sdmmc::{VolumeManager, VolumeIdx, TimeSource, Timestamp};
 
 use embedded_graphics::{
     pixelcolor::Rgb565,
@@ -35,6 +36,14 @@ use mipidsi::{
     options::{ColorInversion, ColorOrder, Orientation, Rotation},
     Builder,
 };
+
+// Minimal time source for embedded-sdmmc (we don't care about real timestamps now)
+struct DummyTime;
+impl TimeSource for DummyTime {
+    fn get_timestamp(&self) -> Timestamp {
+        Timestamp::from_fat(0, 0)
+    }
+}
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -102,6 +111,23 @@ fn main() -> ! {
     match sd.num_bytes() {
         Ok(size) => log::info!("SD size: {} bytes", size),
         Err(_) => log::warn!("SD: failed to read size (no card?)"),
+    }
+
+    // List files in root directory
+    let mut volume_mgr = VolumeManager::new(sd, DummyTime);
+    match volume_mgr.open_volume(VolumeIdx(0)) {
+        Ok(mut volume) => {
+            match volume.open_root_dir() {
+                Ok(root_dir) => {
+                    info!("Listing SD root directory:");
+                    let _ = root_dir.iterate_dir(|e| {
+                        info!(" - {}  {} bytes", e.name, e.size);
+                    });
+                }
+                Err(err) => info!("open_root_dir failed: {:?}", err),
+            }
+        }
+        Err(err) => info!("open_volume failed: {:?}", err),
     }
 
     // ---------------- LCD (SPI) ----------------
