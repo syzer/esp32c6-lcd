@@ -52,6 +52,11 @@ const RAW_W: u32 = 172;
 const RAW_H: u32 = 320;
 const FRAME_SZ: usize = (RAW_W as usize) * (RAW_H as usize) * 2; // bytes
 
+// SPI rate plan
+const SD_INIT_KHZ: u32 = 400;   // during SD card init
+const SD_READ_MHZ: u32 = 20;    // SD read phase
+const LCD_BLIT_MHZ: u32 = 40;   // LCD blit phase (try 60/80 if stable)
+
 // Single frame buffer (~110,080 bytes)
 static mut MOV_FRAMEBUF: [u8; FRAME_SZ] = [0u8; FRAME_SZ];
 
@@ -97,9 +102,9 @@ fn main() -> ! {
     let mosi = peripherals.GPIO6;
     let miso = peripherals.GPIO5; // SD needs MISO
 
-    // Use a moderate frequency that works for both SD init and LCD
+    // Single, conservative rate that works for SD (SPI mode) and LCD
     let spi_cfg = SpiConfig::default()
-        .with_frequency(Rate::from_mhz(12))
+        .with_frequency(Rate::from_mhz(24)) // try 24–25 if stable
         .with_mode(Mode::_0);
 
     let spi_raw = Spi::new(peripherals.SPI2, spi_cfg).unwrap()
