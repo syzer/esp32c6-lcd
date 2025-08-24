@@ -35,3 +35,43 @@ resizeImages:
     done
 
     echo "✅ Done. Converted ${#files[@]} image(s) to assets/rgb/"
+
+
+resizeMovies172x320:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    shopt -s nullglob
+
+    mkdir -p assets/rgb
+
+    files=(assets/mp4/*.mp4)
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo "No mp4 files found in assets/mp4/."
+        exit 1
+    fi
+
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+      echo "ffmpeg not found. Please install it (brew install ffmpeg)" >&2
+      exit 1
+    fi
+
+    count=0
+    for f in "${files[@]}"; do
+        base="$(basename "${f%.mp4}")"
+        out="assets/rgb/${base}_172x320_rgb565.raw"
+        echo "Converting $f -> $out"
+        if ffmpeg -v error -y -i "$f" -vf scale=172:320,format=rgb565le -f rawvideo "$out"; then
+            if [[ -f "$out" ]]; then
+                echo "  ✓ $(du -h "$out" | cut -f1)  $out"
+                count=$((count+1))
+            else
+                echo "  ✗ Failed to create $out" >&2
+                exit 1
+            fi
+        else
+            echo "  ✗ ffmpeg failed for $f" >&2
+            exit 1
+        fi
+    done
+
+    echo "✅ Done. Converted $count movie(s) to assets/rgb/"
