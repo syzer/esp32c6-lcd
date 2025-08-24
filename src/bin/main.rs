@@ -6,7 +6,10 @@
     holding buffers for the duration of a data transfer."
 )]
 
+extern crate alloc;
+
 use esp_backtrace as _;
+use alloc::vec::Vec;
 use esp_hal::clock::CpuClock;
 use core::sync::atomic::AtomicBool;
 use core::cell::RefCell;
@@ -78,7 +81,7 @@ fn main() -> ! {
     wdt1.disable();
     let mut delay = Delay::new();
 
-    let _boot_btn = Input::new(peripherals.GPIO9, InputConfig::default());
+    let boot_btn = Input::new(peripherals.GPIO9, InputConfig::default());
 
     // TODO DMA access for fast write
     let dc = Output::new(peripherals.GPIO15, Level::Low, OutputConfig::default());
@@ -159,47 +162,74 @@ fn main() -> ! {
         Err(err) => { info!("open_root_dir failed: {:?}", err); loop { delay.delay_millis(1000); } }
     };
 
-    let mut chosen: Option<ShortFileName> = None;
+    // Build a playlist of all valid .RAW files in root
+    let mut movies: Vec<ShortFileName> = Vec::new();
     let _ = root_dir.iterate_dir(|e| {
         if !e.attributes.is_directory() && e.name.extension() == b"RAW" {
-            // Prefer names beginning with "NO"
-            if e.name.base_name().starts_with(b"NO") {
-                if chosen.is_none() { chosen = Some(e.name.clone()); }
-            } else if chosen.is_none() {
-                chosen = Some(e.name.clone());
+            let base = e.name.base_name();
+            let sz = e.size as usize;
+            if base.starts_with(b"_") {
+                info!("Skipping AppleDouble/hidden: {} ({} bytes)", e.name, e.size);
+            } else if sz < FRAME_SZ {
+                info!("Skipping too-small RAW: {} ({} bytes < one frame)", e.name, e.size);
+            } else {
+                movies.push(e.name.clone());
             }
         }
     });
+    info!("Found {} movie(s)", movies.len());
 
-    if let Some(chosen_name) = chosen {
-        info!("Playing movie: {} ({}x{} RGB565)", chosen_name, RAW_W, RAW_H);
-        loop {
-            if let Ok(mut file) = root_dir.open_file_in_dir(&chosen_name, SdMode::ReadOnly) {
-                loop {
-                    let n = match file.read(unsafe { &mut MOV_FRAMEBUF[..] }) {
-                        Ok(n) => n,
-                        Err(err) => { info!("Read error: {:?}", err); break; }
-                    };
-                    if n == 0 { break; }
-                    if n < FRAME_SZ { info!("Partial trailing frame ({} bytes), stopping", n); break; }
-
-                    // Draw frame
-                    let raw = ImageRawLE::<Rgb565>::new(unsafe { &MOV_FRAMEBUF[..FRAME_SZ] }, RAW_W);
-                    let _ = Image::new(&raw, Point::new(0, 0)).draw(&mut display);
-
-                    // crude frame pacing; adjust as needed
-                    delay.delay_millis(33);
-                }
-
-                let _ = file.close();
-            } else {
-                info!("open_file_in_dir failed; sleeping forever");
-                loop { delay.delay_millis(1000); }
-            }
-            // Loop movie from the beginning
-        }
-    } else {
+    if movies.is_empty() {
         info!("No .RAW movie found in root.");
         loop { delay.delay_millis(1000); }
+    }
+
+    // Prefer an entry whose base name starts with "NO"; otherwise start at 0
+    let mut idx: usize = 0;
+    for (i, name) in movies.iter().enumerate() {
+        if name.base_name().starts_with(b"NO") { idx = i; break; }
+    }
+
+    info!("Playing movie: {} ({}x{} RGB565)", movies[idx], RAW_W, RAW_H);
+    loop {
+        // Open current movie by short name
+        if let Ok(mut file) = root_dir.open_file_in_dir(&movies[idx], SdMode::ReadOnly) {
+            let mut advance = false;
+            loop {
+                let n = match file.read(unsafe { &mut MOV_FRAMEBUF[..] }) {
+                    Ok(n) => n,
+                    Err(err) => { info!("Read error: {:?}", err); break; }
+                };
+                if n == 0 { break; }
+                if n < FRAME_SZ { info!("Short/invalid frame chunk ({} bytes), skipping movie", n); advance = true; break; }
+
+                let raw = ImageRawLE::<Rgb565>::new(unsafe { &MOV_FRAMEBUF[..FRAME_SZ] }, RAW_W);
+                let _ = Image::new(&raw, Point::new(0, 0)).draw(&mut display);
+
+                // BOOT edge detect (active-low)
+                let pressed = boot_btn.is_low();
+                let was_pressed = PREV.swap(pressed, core::sync::atomic::Ordering::Relaxed);
+                if pressed && !was_pressed {
+                    info!("BOOT pressed");
+                    advance = true; // switch to next movie
+                } else if !pressed && was_pressed {
+                    info!("BOOT released");
+                }
+
+                // crude frame pacing; adjust as needed (also acts as a tiny debounce)
+                delay.delay_millis(3);
+                if advance { break; }
+            }
+            let _ = file.close();
+
+            if advance {
+                idx = (idx + 1) % movies.len();
+                info!("Next movie: {}", movies[idx]);
+            }
+        } else {
+            info!("open_file_in_dir failed; sleeping forever");
+            loop { delay.delay_millis(1000); }
+        }
+        // Loop: reopen current (or next) movie
     }
 }
