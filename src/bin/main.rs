@@ -192,43 +192,41 @@ fn main() -> ! {
 
     info!("Playing movie: {} ({}x{} RGB565)", movies[idx], RAW_W, RAW_H);
     loop {
-        // Open current movie by short name
-        if let Ok(mut file) = root_dir.open_file_in_dir(&movies[idx], SdMode::ReadOnly) {
-            let mut advance = false;
-            loop {
-                let n = match file.read(unsafe { &mut MOV_FRAMEBUF[..] }) {
-                    Ok(n) => n,
-                    Err(err) => { info!("Read error: {:?}", err); break; }
-                };
-                if n == 0 { break; }
-                if n < FRAME_SZ { info!("Short/invalid frame chunk ({} bytes), skipping movie", n); advance = true; break; }
-
-                let raw = ImageRawLE::<Rgb565>::new(unsafe { &MOV_FRAMEBUF[..FRAME_SZ] }, RAW_W);
-                let _ = Image::new(&raw, Point::new(0, 0)).draw(&mut display);
-
-                // BOOT edge detect (active-low)
-                let pressed = boot_btn.is_low();
-                let was_pressed = PREV.swap(pressed, core::sync::atomic::Ordering::Relaxed);
-                if pressed && !was_pressed {
-                    info!("BOOT pressed");
-                    advance = true; // switch to next movie
-                } else if !pressed && was_pressed {
-                    info!("BOOT released");
-                }
-
-                // crude frame pacing; adjust as needed (also acts as a tiny debounce)
-                delay.delay_millis(3);
-                if advance { break; }
-            }
-            let _ = file.close();
-
-            if advance {
-                idx = (idx + 1) % movies.len();
-                info!("Next movie: {}", movies[idx]);
-            }
-        } else {
+        let Ok(mut file) = root_dir.open_file_in_dir(&movies[idx], SdMode::ReadOnly) else {
             info!("open_file_in_dir failed; sleeping forever");
             loop { delay.delay_millis(1000); }
+        };
+        let mut advance = false;
+        loop {
+            let n = match file.read(unsafe { &mut MOV_FRAMEBUF[..] }) {
+                Ok(n) => n,
+                Err(err) => { info!("Read error: {:?}", err); break; }
+            };
+            if n == 0 { break; }
+            if n < FRAME_SZ { info!("Short/invalid frame chunk ({} bytes), skipping movie", n); advance = true; break; }
+
+            let raw = ImageRawLE::<Rgb565>::new(unsafe { &MOV_FRAMEBUF[..FRAME_SZ] }, RAW_W);
+            let _ = Image::new(&raw, Point::new(0, 0)).draw(&mut display);
+
+            // BOOT edge detect (active-low)
+            let pressed = boot_btn.is_low();
+            let was_pressed = PREV.swap(pressed, core::sync::atomic::Ordering::Relaxed);
+            if pressed && !was_pressed {
+                info!("BOOT pressed");
+                advance = true; // switch to next movie
+            } else if !pressed && was_pressed {
+                info!("BOOT released");
+            }
+
+            // crude frame pacing; adjust as needed (also acts as a tiny debounce)
+            delay.delay_millis(3);
+            if advance { break; }
+        }
+        let _ = file.close();
+
+        if advance {
+            idx = (idx + 1) % movies.len();
+            info!("Next movie: {}", movies[idx]);
         }
         // Loop: reopen current (or next) movie
     }
