@@ -5,8 +5,13 @@ or
 https://www.waveshare.com/wiki/ESP32-C6-LCD-1.47
 
 ![Esp32C6WIthLCD_small.jpeg](docs/Esp32C6WIthLCD_small.jpeg)
-```
+```bash
 #run with 
+cargo install just
+just resizeImages
+just release
+
+# (or )
 cargo run --release
 ```
 # ESP-C6 LCD Demo
