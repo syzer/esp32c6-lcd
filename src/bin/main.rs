@@ -55,6 +55,13 @@ const FRAME_SZ: usize = (RAW_W as usize) * (RAW_H as usize) * 2; // bytes
 // Single frame buffer (~110,080 bytes)
 static mut MOV_FRAMEBUF: [u8; FRAME_SZ] = [0u8; FRAME_SZ];
 
+// Ping-pong tile buffers for overlapped read/blit (line-aligned)
+const BYTES_PER_LINE: usize = (RAW_W as usize) * 2;
+const LINES_PER_CHUNK: usize = 94; // 94 * 344 = 32336 bytes (< 32KB)
+const CHUNK_BYTES: usize = BYTES_PER_LINE * LINES_PER_CHUNK;
+static mut TILE_A: [u8; CHUNK_BYTES] = [0u8; CHUNK_BYTES];
+static mut TILE_B: [u8; CHUNK_BYTES] = [0u8; CHUNK_BYTES];
+
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -83,7 +90,6 @@ fn main() -> ! {
 
     let boot_btn = Input::new(peripherals.GPIO9, InputConfig::default());
 
-    // TODO DMA access for fast write
     let dc = Output::new(peripherals.GPIO15, Level::Low, OutputConfig::default());
     // Define the reset pin as digital outputs and make it high
     let mut rst = Output::new(peripherals.GPIO21, Level::Low, OutputConfig::default());
@@ -197,30 +203,69 @@ fn main() -> ! {
             loop { delay.delay_millis(1000); }
         };
         let mut advance = false;
+        let mut eof = false;
         loop {
-            let n = match file.read(unsafe { &mut MOV_FRAMEBUF[..] }) {
+            // --- Read & draw one full frame using ping-pong tiles ---
+            let mut remaining = FRAME_SZ;
+            let mut y: i32 = 0;
+
+            // Prefetch first chunk into A
+            let want0 = core::cmp::min(CHUNK_BYTES, remaining);
+            let n0 = match file.read(unsafe { &mut TILE_A[..want0] }) {
                 Ok(n) => n,
-                Err(err) => { info!("Read error: {:?}", err); break; }
+                Err(err) => { info!("Read error: {:?}", err); advance = true; break; }
             };
-            if n == 0 { break; }
-            if n < FRAME_SZ { info!("Short/invalid frame chunk ({} bytes), skipping movie", n); advance = true; break; }
+            if n0 == 0 { eof = true; break; }
+            if n0 % BYTES_PER_LINE != 0 { info!("Unaligned first chunk ({}), skipping movie", n0); advance = true; break; }
+            remaining -= n0;
 
-            let raw = ImageRawLE::<Rgb565>::new(unsafe { &MOV_FRAMEBUF[..FRAME_SZ] }, RAW_W);
-            let _ = Image::new(&raw, Point::new(0, 0)).draw(&mut display);
+            // Draw first chunk while we read the next into B
+            // (Note: this path is blocking; switching to SPI DMA makes it overlap.)
+            let mut use_a = true;
+            let mut cur_len = n0;
+            loop {
+                // Draw the chunk currently filled
+                let (ptr, len) = if use_a {
+                    (unsafe { &TILE_A[..cur_len] }, cur_len)
+                } else {
+                    (unsafe { &TILE_B[..cur_len] }, cur_len)
+                };
+                let raw = ImageRawLE::<Rgb565>::new(ptr, RAW_W);
+                let _ = Image::new(&raw, Point::new(0, y)).draw(&mut display);
+                y += (len / BYTES_PER_LINE) as i32;
 
-            // BOOT edge detect (active-low)
-            let pressed = boot_btn.is_low();
-            let was_pressed = PREV.swap(pressed, core::sync::atomic::Ordering::Relaxed);
-            if pressed && !was_pressed {
-                info!("BOOT pressed");
-                advance = true; // switch to next movie
-            } else if !pressed && was_pressed {
-                info!("BOOT released");
+                if remaining == 0 { break; }
+
+                // Read next chunk into the other buffer
+                let want = core::cmp::min(CHUNK_BYTES, remaining);
+                let dst = if use_a {
+                    unsafe { &mut TILE_B[..want] }
+                } else {
+                    unsafe { &mut TILE_A[..want] }
+                };
+                let n = match file.read(dst) {
+                    Ok(n) => n,
+                    Err(err) => { info!("Read error: {:?}", err); advance = true; break; }
+                };
+                if n == 0 { eof = true; break; }
+                if n % BYTES_PER_LINE != 0 { info!("Unaligned chunk ({}), skipping movie", n); advance = true; break; }
+                remaining -= n;
+                cur_len = n;
+                use_a = !use_a;
+
+                // BOOT edge detect during frame
+                let pressed = boot_btn.is_low();
+                let was_pressed = PREV.swap(pressed, core::sync::atomic::Ordering::Relaxed);
+                if pressed && !was_pressed {
+                    info!("BOOT pressed");
+                    advance = true;
+                    break;
+                } else if !pressed && was_pressed {
+                    info!("BOOT released");
+                }
             }
 
-            // crude frame pacing; adjust as needed (also acts as a tiny debounce)
-            delay.delay_millis(3);
-            if advance { break; }
+            if advance || eof { break; }
         }
         let _ = file.close();
 
