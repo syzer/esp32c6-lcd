@@ -9,9 +9,10 @@
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::cell::RefCell;
 static PREV: AtomicBool = AtomicBool::new(false);
 use esp_hal::delay::Delay;
-use esp_hal::gpio::{self, Level, Output, OutputConfig, Input, InputConfig};
+use esp_hal::gpio::{Level, Output, OutputConfig, Input, InputConfig};
 use esp_hal::main;
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
@@ -19,14 +20,14 @@ use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use log::info;
+use embedded_hal_bus::spi::RefCellDevice;
+use embedded_sdmmc::sdcard::SdCard;
 
 use embedded_graphics::{
-    pixelcolor::{Rgb565},
+    pixelcolor::Rgb565,
     prelude::*,
     image::{Image, ImageRawLE},
 };
-
-use embedded_hal_bus::spi::ExclusiveDevice;
 
 use mipidsi::{
     interface::SpiInterface,
@@ -72,27 +73,47 @@ fn main() -> ! {
     let mut bl = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
     bl.set_high();
 
-    // Define the SPI pins and create the SPI interface
+    // Define the SPI pins and create the shared SPI interface
     let sck = peripherals.GPIO7;
-    let miso = gpio::NoPin;
     let mosi = peripherals.GPIO6;
-    let cs = peripherals.GPIO14;
+    let miso = peripherals.GPIO5; // SD needs MISO
+
+    // Use a moderate frequency that works for both SD init and LCD
     let spi_cfg = SpiConfig::default()
-        .with_frequency(Rate::from_mhz(80))
+        .with_frequency(Rate::from_mhz(12))
         .with_mode(Mode::_0);
-    let spi = Spi::new(peripherals.SPI2, spi_cfg).unwrap();
-    let spi = spi
+
+    let spi_raw = Spi::new(peripherals.SPI2, spi_cfg).unwrap()
         .with_sck(sck)
         .with_mosi(mosi)
         .with_miso(miso);
 
-    let cs_output = Output::new(cs, Level::High, OutputConfig::default());
-    let spi_device = ExclusiveDevice::new_no_delay(spi, cs_output).unwrap();
+    let spi_bus = RefCell::new(spi_raw);
+    let sd_dev_delay = Delay::new();
+
+    // ---------------- SD card (SPI) ----------------
+    // SD CS on GPIO4 per board pinout; use an ExclusiveDevice on the same SPI2 bus
+    let sd_cs = Output::new(peripherals.GPIO4, Level::High, OutputConfig::default());
+    let sd_dev = RefCellDevice::new(&spi_bus, sd_cs, sd_dev_delay).unwrap();
+
+    // Initialize SD card (SPI mode). `SdCard::new` returns the card directly (not a Result).
+    // Probe capacity (may return an error if no card inserted), then release the bus for LCD use.
+    let sd = SdCard::new(sd_dev, &mut delay);
+    match sd.num_bytes() {
+        Ok(size) => log::info!("SD size: {} bytes", size),
+        Err(_) => log::warn!("SD: failed to read size (no card?)"),
+    }
+
+    // ---------------- LCD (SPI) ----------------
+    // Create a new ExclusiveDevice for the LCD on CS GPIO14 and reuse the same SPI bus.
+    let lcd_dev_delay = Delay::new();
+    let lcd_cs = Output::new(peripherals.GPIO14, Level::High, OutputConfig::default());
+    let lcd_dev = RefCellDevice::new(&spi_bus, lcd_cs, lcd_dev_delay).unwrap();
 
     let mut buffer = [0_u8; 512];
 
-    // Define the display interface with no chip select
-    let di = SpiInterface::new(spi_device, dc, &mut buffer);
+    // Define the display interface with LCD device + DC
+    let di = SpiInterface::new(lcd_dev, dc, &mut buffer);
 
     // Define the display from the display interface and initialize it
     let mut display = Builder::new(ST7789, di)
@@ -105,7 +126,7 @@ fn main() -> ! {
         .init(&mut delay)
         .unwrap();
 
-    // Make the display all white
+    // Clear the display
     display.clear(Rgb565::BLACK).unwrap();
     const RAW_W: u32 = 172;
     const RAW_H: u32 = 320;

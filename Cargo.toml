@@ -30,7 +30,7 @@ mipidsi = "0.9.0"
 fugit = "0.3.7"
 embedded-hal-bus = "0.3.0"
 embedded-graphics = "0.8.1"
-
+embedded-sdmmc = { version = "0.9.0" }
 
 [profile.dev]
 # Rust debug is too slow.
