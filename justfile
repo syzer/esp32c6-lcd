@@ -1,5 +1,8 @@
 release:
-  cargo run --release
+  cargo run --bin main_images --release
+
+releaseMovies:
+  cargo run --bin esp-c6-lcd --release
 
 resizeImages:
     #!/usr/bin/env bash

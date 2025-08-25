@@ -27,9 +27,8 @@ use embedded_hal_bus::spi::RefCellDevice;
 use embedded_sdmmc::{SdCard, VolumeManager, VolumeIdx, TimeSource, Timestamp, Mode as SdMode, ShortFileName};
 
 use embedded_graphics::{
-    pixelcolor::Rgb565,
+    pixelcolor::{Rgb565, raw::RawU16},
     prelude::*,
-    image::{Image, ImageRawLE},
 };
 
 use mipidsi::{
@@ -50,12 +49,17 @@ impl TimeSource for DummyTime {
 // RAW movie geometry for 172x320 RGB565LE frames
 const RAW_W: u32 = 172;
 const RAW_H: u32 = 320;
+
+const SPI_SD_CARD_MHZ: u32 = 60;
+
 const FRAME_SZ: usize = (RAW_W as usize) * (RAW_H as usize) * 2; // bytes
 
-// SPI rate plan
-const SD_INIT_KHZ: u32 = 400;   // during SD card init
-const SD_READ_MHZ: u32 = 20;    // SD read phase
-const LCD_BLIT_MHZ: u32 = 40;   // LCD blit phase (try 60/80 if stable)
+// 64-line tiles (22,016 B) → multiple of 512 B (sectors) and 344 B (line size)
+const BYTES_PER_LINE: usize = (RAW_W as usize) * 2; // 344 bytes per line
+const LINES_PER_CHUNK: usize = 64;                  // 64 lines per tile
+const CHUNK_BYTES: usize = BYTES_PER_LINE * LINES_PER_CHUNK; // 22,016 B
+static mut TILE_A: [u8; CHUNK_BYTES] = [0u8; CHUNK_BYTES];
+static mut TILE_B: [u8; CHUNK_BYTES] = [0u8; CHUNK_BYTES];
 
 // Single frame buffer (~110,080 bytes)
 static mut MOV_FRAMEBUF: [u8; FRAME_SZ] = [0u8; FRAME_SZ];
@@ -104,7 +108,8 @@ fn main() -> ! {
 
     // Single, conservative rate that works for SD (SPI mode) and LCD
     let spi_cfg = SpiConfig::default()
-        .with_frequency(Rate::from_mhz(24)) // try 24–25 if stable
+        .with_frequency(Rate::from_mhz(SPI_SD_CARD_MHZ))
+        // try 24–25 if stable on your wiring
         .with_mode(Mode::_0);
 
     let spi_raw = Spi::new(peripherals.SPI2, spi_cfg).unwrap()
@@ -142,7 +147,7 @@ fn main() -> ! {
     let lcd_cs = Output::new(peripherals.GPIO14, Level::High, OutputConfig::default());
     let lcd_dev = RefCellDevice::new(&spi_bus, lcd_cs, lcd_dev_delay).unwrap();
 
-    let mut buffer = [0_u8; 512];
+    let mut buffer = [0_u8; 4096];
 
     // Define the display interface with LCD device + DC
     let di = SpiInterface::new(lcd_dev, dc, &mut buffer);
@@ -202,30 +207,79 @@ fn main() -> ! {
             loop { delay.delay_millis(1000); }
         };
         let mut advance = false;
+        let mut eof = false;
         loop {
-            let n = match file.read(unsafe { &mut MOV_FRAMEBUF[..] }) {
+            // --- Stream one full frame in 64-line tiles (22,016 B each) ---
+            let mut remaining = FRAME_SZ;
+            let mut y: i32 = 0;
+
+            // Prefetch first tile into A
+            let want0 = core::cmp::min(CHUNK_BYTES, remaining);
+            let n0 = match file.read(unsafe { &mut TILE_A[..want0] }) {
                 Ok(n) => n,
-                Err(err) => { info!("Read error: {:?}", err); break; }
+                Err(err) => { info!("Read error: {:?}", err); advance = true; break; }
             };
-            if n == 0 { break; }
-            if n < FRAME_SZ { info!("Short/invalid frame chunk ({} bytes), skipping movie", n); advance = true; break; }
+            if n0 == 0 { eof = true; break; }
+            if n0 % BYTES_PER_LINE != 0 { info!("Unaligned first tile ({} B), skipping movie", n0); advance = true; break; }
+            remaining -= n0;
 
-            let raw = ImageRawLE::<Rgb565>::new(unsafe { &MOV_FRAMEBUF[..FRAME_SZ] }, RAW_W);
-            let _ = Image::new(&raw, Point::new(0, 0)).draw(&mut display);
-
-            // BOOT edge detect (active-low)
-            let pressed = boot_btn.is_low();
-            let was_pressed = PREV.swap(pressed, core::sync::atomic::Ordering::Relaxed);
-            if pressed && !was_pressed {
-                info!("BOOT pressed");
-                advance = true; // switch to next movie
-            } else if !pressed && was_pressed {
-                info!("BOOT released");
+            // Iterator to map LE u16 -> Rgb565 without copying
+            struct Rgb565Le<'a> { chunks: core::slice::ChunksExact<'a, u8> }
+            impl<'a> Iterator for Rgb565Le<'a> {
+                type Item = Rgb565;
+                #[inline]
+                fn next(&mut self) -> Option<Self::Item> {
+                    let b = self.chunks.next()?;
+                    let v = u16::from_le_bytes([b[0], b[1]]);
+                    Some(Rgb565::from(RawU16::from(v)))
+                }
             }
 
-            // crude frame pacing; adjust as needed (also acts as a tiny debounce)
-            delay.delay_millis(3);
-            if advance { break; }
+            // Draw first tile, then ping-pong A/B until the frame is done
+            let mut use_a = true;
+            let mut cur_len = n0;
+
+            loop {
+                // Current tile slice
+                let (ptr, len) = if use_a { (unsafe { &TILE_A[..cur_len] }, cur_len) } else { (unsafe { &TILE_B[..cur_len] }, cur_len) };
+
+                // Compute tile height in lines and blast it in one RAMWR
+                let lines = (len / BYTES_PER_LINE) as u16;
+                let y0 = y as u16;
+                let y1 = y0 + lines - 1;
+
+                let iter = Rgb565Le { chunks: ptr.chunks_exact(2) };
+                let _ = display.set_pixels(0, y0, (RAW_W - 1) as u16, y1, iter);
+                y += lines as i32;
+
+                if remaining == 0 { break; }
+
+                // Read next tile into the other buffer (22,016 B or tail)
+                let want = core::cmp::min(CHUNK_BYTES, remaining);
+                let dst = if use_a { unsafe { &mut TILE_B[..want] } } else { unsafe { &mut TILE_A[..want] } };
+                let n = match file.read(dst) {
+                    Ok(n) => n,
+                    Err(err) => { info!("Read error: {:?}", err); advance = true; break; }
+                };
+                if n == 0 { eof = true; break; }
+                if n % BYTES_PER_LINE != 0 { info!("Unaligned tile ({} B), skipping movie", n); advance = true; break; }
+                remaining -= n;
+                cur_len = n;
+                use_a = !use_a;
+
+                // BOOT edge detect during streaming
+                let pressed = boot_btn.is_low();
+                let was_pressed = PREV.swap(pressed, core::sync::atomic::Ordering::Relaxed);
+                if pressed && !was_pressed {
+                    info!("BOOT pressed");
+                    advance = true;
+                    break;
+                } else if !pressed && was_pressed {
+                    info!("BOOT released");
+                }
+            }
+
+            if advance || eof { break; }
         }
         let _ = file.close();
 
