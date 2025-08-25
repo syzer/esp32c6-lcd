@@ -1,10 +1,11 @@
 # WAT 
-esp32 c6 with LCS
 1. Movies
 2. Images
 3. Graphics
-
+4. 
 ![P_20250825_102248.jpeg](docs/P_20250825_102248.jpeg)
+
+esp32 c6 with LCD waveshare or spotpear
 ![Esp32C6WIthLCD_small.jpeg](docs/Esp32C6WIthLCD_small.jpeg)
 
 
@@ -46,6 +47,9 @@ This project demonstrates using the **ESP32-C6** with an **ST7789 1.47" LCD disp
 - Uses `esp_bootloader_esp_idf::esp_app_desc!()` for bootloader compatibility
 
 ## Hardware
+https://spotpear.com/wiki/ESP32-C6-1.47-inch-LCD-Display-Screen-LVGL-SD-WIFI6-ST7789.html#VScode
+or
+https://www.waveshare.com/wiki/ESP32-C6-LCD-1.47
 - **Board**: Spotpear ESP32-C6 with 1.47" LCD (ST7789)
 - **Connections**:
   - SCLK → GPIO10
