@@ -6,12 +6,16 @@
     holding buffers for the duration of a data transfer."
 )]
 
+extern crate alloc;
+
 use esp_backtrace as _;
+use alloc::vec::Vec;
 use esp_hal::clock::CpuClock;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::AtomicBool;
+use core::cell::RefCell;
 static PREV: AtomicBool = AtomicBool::new(false);
 use esp_hal::delay::Delay;
-use esp_hal::gpio::{self, Level, Output, OutputConfig, Input, InputConfig};
+use esp_hal::gpio::{Level, Output, OutputConfig, Input, InputConfig};
 use esp_hal::main;
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
@@ -19,14 +23,13 @@ use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use log::info;
+use embedded_hal_bus::spi::RefCellDevice;
+use embedded_sdmmc::{SdCard, VolumeManager, VolumeIdx, TimeSource, Timestamp, Mode as SdMode, ShortFileName};
 
 use embedded_graphics::{
-    pixelcolor::{Rgb565},
+    pixelcolor::{Rgb565, raw::RawU16},
     prelude::*,
-    image::{Image, ImageRawLE},
 };
-
-use embedded_hal_bus::spi::ExclusiveDevice;
 
 use mipidsi::{
     interface::SpiInterface,
@@ -34,6 +37,32 @@ use mipidsi::{
     options::{ColorInversion, ColorOrder, Orientation, Rotation},
     Builder,
 };
+
+// Minimal time source for embedded-sdmmc (we don't care about real timestamps now)
+struct DummyTime;
+impl TimeSource for DummyTime {
+    fn get_timestamp(&self) -> Timestamp {
+        Timestamp::from_fat(0, 0)
+    }
+}
+
+// RAW movie geometry for 172x320 RGB565LE frames
+const RAW_W: u32 = 172;
+const RAW_H: u32 = 320;
+
+const SPI_SD_CARD_MHZ: u32 = 60;
+
+const FRAME_SZ: usize = (RAW_W as usize) * (RAW_H as usize) * 2; // bytes
+
+// 64-line tiles (22,016 B) → multiple of 512 B (sectors) and 344 B (line size)
+const BYTES_PER_LINE: usize = (RAW_W as usize) * 2; // 344 bytes per line
+const LINES_PER_CHUNK: usize = 64;                  // 64 lines per tile
+const CHUNK_BYTES: usize = BYTES_PER_LINE * LINES_PER_CHUNK; // 22,016 B
+static mut TILE_A: [u8; CHUNK_BYTES] = [0u8; CHUNK_BYTES];
+static mut TILE_B: [u8; CHUNK_BYTES] = [0u8; CHUNK_BYTES];
+
+// Single frame buffer (~110,080 bytes)
+static mut MOV_FRAMEBUF: [u8; FRAME_SZ] = [0u8; FRAME_SZ];
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -72,27 +101,56 @@ fn main() -> ! {
     let mut bl = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
     bl.set_high();
 
-    // Define the SPI pins and create the SPI interface
+    // Define the SPI pins and create the shared SPI interface
     let sck = peripherals.GPIO7;
-    let miso = gpio::NoPin;
     let mosi = peripherals.GPIO6;
-    let cs = peripherals.GPIO14;
+    let miso = peripherals.GPIO5; // SD needs MISO
+
+    // Single, conservative rate that works for SD (SPI mode) and LCD
     let spi_cfg = SpiConfig::default()
-        .with_frequency(Rate::from_mhz(80))
+        .with_frequency(Rate::from_mhz(SPI_SD_CARD_MHZ))
+        // try 24–25 if stable on your wiring
         .with_mode(Mode::_0);
-    let spi = Spi::new(peripherals.SPI2, spi_cfg).unwrap();
-    let spi = spi
+
+    let spi_raw = Spi::new(peripherals.SPI2, spi_cfg).unwrap()
         .with_sck(sck)
         .with_mosi(mosi)
         .with_miso(miso);
 
-    let cs_output = Output::new(cs, Level::High, OutputConfig::default());
-    let spi_device = ExclusiveDevice::new_no_delay(spi, cs_output).unwrap();
+    let spi_bus = RefCell::new(spi_raw);
+    let sd_dev_delay = Delay::new();
 
-    let mut buffer = [0_u8; 512];
+    // ---------------- SD card (SPI) ----------------
+    // SD CS on GPIO4 per board pinout; use an ExclusiveDevice on the same SPI2 bus
+    let sd_cs = Output::new(peripherals.GPIO4, Level::High, OutputConfig::default());
+    let sd_dev = RefCellDevice::new(&spi_bus, sd_cs, sd_dev_delay).unwrap();
+    let mut sd_delay_for_card = Delay::new();
 
-    // Define the display interface with no chip select
-    let di = SpiInterface::new(spi_device, dc, &mut buffer);
+    // Initialize SD card (SPI mode). `SdCard::new` returns the card directly (not a Result).
+    // Probe capacity (may return an error if no card inserted), then release the bus for LCD use.
+    let sd = SdCard::new(sd_dev, &mut sd_delay_for_card);
+    match sd.num_bytes() {
+        Ok(size) => log::info!("SD size: {} bytes", size),
+        Err(_) => log::warn!("SD: failed to read size (no card?)"),
+    }
+
+    // Prepare FAT volume manager (keep it alive for movie playback)
+    let mut volume_mgr = VolumeManager::new(sd, DummyTime);
+    let mut volume = match volume_mgr.open_volume(VolumeIdx(0)) {
+        Ok(v) => v,
+        Err(err) => { info!("open_volume failed: {:?}", err); loop { delay.delay_millis(1000); } }
+    };
+
+    // ---------------- LCD (SPI) ----------------
+    // Create a new ExclusiveDevice for the LCD on CS GPIO14 and reuse the same SPI bus.
+    let lcd_dev_delay = Delay::new();
+    let lcd_cs = Output::new(peripherals.GPIO14, Level::High, OutputConfig::default());
+    let lcd_dev = RefCellDevice::new(&spi_bus, lcd_cs, lcd_dev_delay).unwrap();
+
+    let mut buffer = [0_u8; 4096];
+
+    // Define the display interface with LCD device + DC
+    let di = SpiInterface::new(lcd_dev, dc, &mut buffer);
 
     // Define the display from the display interface and initialize it
     let mut display = Builder::new(ST7789, di)
@@ -105,42 +163,130 @@ fn main() -> ! {
         .init(&mut delay)
         .unwrap();
 
-    // Make the display all white
+    // Clear the display
     display.clear(Rgb565::BLACK).unwrap();
-    const RAW_W: u32 = 172;
-    const RAW_H: u32 = 320;
 
-    // Two images: toggle with BOOT button
-    let pic1: &[u8] = include_bytes!("../../assets/rgb/pic_1_172x320.rgb565");
-    let pic2: &[u8] = include_bytes!("../../assets/rgb/pic_2_172x320.rgb565");
-    let raw1 = ImageRawLE::<Rgb565>::new(pic1, RAW_W);
-    let raw2 = ImageRawLE::<Rgb565>::new(pic2, RAW_W);
-    let mut img_idx: usize = 0;
+    // Open root dir and choose a movie file: prefer names starting with "NO" (e.g., NO_COW...), else first .RAW
+    let mut root_dir = match volume.open_root_dir() {
+        Ok(d) => d,
+        Err(err) => { info!("open_root_dir failed: {:?}", err); loop { delay.delay_millis(1000); } }
+    };
 
-    // Draw initial image
-    Image::new(&raw1, Point::new(0, 0))
-        .draw(&mut display)
-        .unwrap();
-
-    loop {
-        // Poll BOOT (GPIO9). Active-low on most boards.
-        let pressed = boot_btn.is_low();
-        let was_pressed = PREV.load(Ordering::Relaxed);
-        if pressed && !was_pressed {
-            info!("BOOT pressed");
-            // Toggle image index and draw
-            img_idx ^= 1;
-            match img_idx {
-                0 => { Image::new(&raw1, Point::new(0, 0)).draw(&mut display).ok(); }
-                _ => { Image::new(&raw2, Point::new(0, 0)).draw(&mut display).ok(); }
+    // Build a playlist of all valid .RAW files in root
+    let mut movies: Vec<ShortFileName> = Vec::new();
+    let _ = root_dir.iterate_dir(|e| {
+        if !e.attributes.is_directory() && e.name.extension() == b"RAW" {
+            let base = e.name.base_name();
+            let sz = e.size as usize;
+            if base.starts_with(b"_") {
+                info!("Skipping AppleDouble/hidden: {} ({} bytes)", e.name, e.size);
+            } else if sz < FRAME_SZ {
+                info!("Skipping too-small RAW: {} ({} bytes < one frame)", e.name, e.size);
+            } else {
+                movies.push(e.name.clone());
             }
         }
-        if !pressed && was_pressed {
-            info!("BOOT released");
-        }
-        PREV.store(pressed, Ordering::Relaxed);
+    });
+    info!("Found {} movie(s)", movies.len());
 
-        // Also print a dot periodically so you see liveness
-        delay.delay_millis(50);
+    if movies.is_empty() {
+        info!("No .RAW movie found in root.");
+        loop { delay.delay_millis(1000); }
+    }
+
+    // Prefer an entry whose base name starts with "NO"; otherwise start at 0
+    let mut idx: usize = 0;
+    for (i, name) in movies.iter().enumerate() {
+        if name.base_name().starts_with(b"NO") { idx = i; break; }
+    }
+
+    info!("Playing movie: {} ({}x{} RGB565)", movies[idx], RAW_W, RAW_H);
+    loop {
+        let Ok(mut file) = root_dir.open_file_in_dir(&movies[idx], SdMode::ReadOnly) else {
+            info!("open_file_in_dir failed; sleeping forever");
+            loop { delay.delay_millis(1000); }
+        };
+        let mut advance = false;
+        let mut eof = false;
+        loop {
+            // --- Stream one full frame in 64-line tiles (22,016 B each) ---
+            let mut remaining = FRAME_SZ;
+            let mut y: i32 = 0;
+
+            // Prefetch first tile into A
+            let want0 = core::cmp::min(CHUNK_BYTES, remaining);
+            let n0 = match file.read(unsafe { &mut TILE_A[..want0] }) {
+                Ok(n) => n,
+                Err(err) => { info!("Read error: {:?}", err); advance = true; break; }
+            };
+            if n0 == 0 { eof = true; break; }
+            if n0 % BYTES_PER_LINE != 0 { info!("Unaligned first tile ({} B), skipping movie", n0); advance = true; break; }
+            remaining -= n0;
+
+            // Iterator to map LE u16 -> Rgb565 without copying
+            struct Rgb565Le<'a> { chunks: core::slice::ChunksExact<'a, u8> }
+            impl<'a> Iterator for Rgb565Le<'a> {
+                type Item = Rgb565;
+                #[inline]
+                fn next(&mut self) -> Option<Self::Item> {
+                    let b = self.chunks.next()?;
+                    let v = u16::from_le_bytes([b[0], b[1]]);
+                    Some(Rgb565::from(RawU16::from(v)))
+                }
+            }
+
+            // Draw first tile, then ping-pong A/B until the frame is done
+            let mut use_a = true;
+            let mut cur_len = n0;
+
+            loop {
+                // Current tile slice
+                let (ptr, len) = if use_a { (unsafe { &TILE_A[..cur_len] }, cur_len) } else { (unsafe { &TILE_B[..cur_len] }, cur_len) };
+
+                // Compute tile height in lines and blast it in one RAMWR
+                let lines = (len / BYTES_PER_LINE) as u16;
+                let y0 = y as u16;
+                let y1 = y0 + lines - 1;
+
+                let iter = Rgb565Le { chunks: ptr.chunks_exact(2) };
+                let _ = display.set_pixels(0, y0, (RAW_W - 1) as u16, y1, iter);
+                y += lines as i32;
+
+                if remaining == 0 { break; }
+
+                // Read next tile into the other buffer (22,016 B or tail)
+                let want = core::cmp::min(CHUNK_BYTES, remaining);
+                let dst = if use_a { unsafe { &mut TILE_B[..want] } } else { unsafe { &mut TILE_A[..want] } };
+                let n = match file.read(dst) {
+                    Ok(n) => n,
+                    Err(err) => { info!("Read error: {:?}", err); advance = true; break; }
+                };
+                if n == 0 { eof = true; break; }
+                if n % BYTES_PER_LINE != 0 { info!("Unaligned tile ({} B), skipping movie", n); advance = true; break; }
+                remaining -= n;
+                cur_len = n;
+                use_a = !use_a;
+
+                // BOOT edge detect during streaming
+                let pressed = boot_btn.is_low();
+                let was_pressed = PREV.swap(pressed, core::sync::atomic::Ordering::Relaxed);
+                if pressed && !was_pressed {
+                    info!("BOOT pressed");
+                    advance = true;
+                    break;
+                } else if !pressed && was_pressed {
+                    info!("BOOT released");
+                }
+            }
+
+            if advance || eof { break; }
+        }
+        let _ = file.close();
+
+        if advance {
+            idx = (idx + 1) % movies.len();
+            info!("Next movie: {}", movies[idx]);
+        }
+        // Loop: reopen current (or next) movie
     }
 }
